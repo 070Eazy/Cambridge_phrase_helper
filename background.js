@@ -1,3 +1,7 @@
+// 本地内存缓存，避免重复查询相同短语
+const memoryCache = new Map();
+
+// 常见不规则动词还原表
 const IRREGULAR_VERBS = {
   brought: "bring", took: "take", taken: "take", made: "make",
   went: "go", gone: "go", came: "come", saw: "see", seen: "see",
@@ -66,23 +70,47 @@ function buildSearchCandidates(rawQuery) {
       const candidate = [f, ...words.slice(1)].join(" ");
       if (!list.includes(candidate)) list.push(candidate);
     }
-  } else if (words.length === 1) {
-    for (const f of deinflectFirstWord(words[0])) {
-      if (!list.includes(f)) list.push(f);
-    }
   }
 
+  // 3 词短语自动回退（如 all but certain -> all but）
   if (words.length >= 3) {
     const firstTwo = words.slice(0, 2).join(" ");
     if (!list.includes(firstTwo)) list.push(firstTwo);
-    const lastTwo = words.slice(-2).join(" ");
-    if (!list.includes(lastTwo)) list.push(lastTwo);
   }
-  return list.slice(0, 3);
+  return list.slice(0, 2); // 限制最多2个核心候选，杜绝排队延迟
 }
 
-// 核心修复：后台标签页注入“轮询检查”，确保剑桥的释义节点彻底渲染完成后再返回
-async function fetchViaBackgroundTab(url) {
+// 1. 超轻量级快速 Fetch（耗时通常 < 800ms，只拉 HTML 字符，不加载广告/图片）
+async function quickFetchHtml(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500); // 2.5秒超时断开
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      credentials: "include",
+      headers: {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+      },
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (res.status === 200) {
+      const html = await res.text();
+      const hit = html.includes("def-block") || html.includes("ddef_block") || html.includes("phrase-block");
+      if (hit) {
+        return { html, finalUrl: res.url, hit: true };
+      }
+    }
+  } catch (e) {
+    clearTimeout(timer);
+  }
+  return { html: "", finalUrl: url, hit: false };
+}
+
+// 2. 闪电探测后台标签页（绝不傻等 complete，释义节点一出现立刻秒关标签页）
+async function fastTabProbe(url) {
   return new Promise((resolve) => {
     chrome.tabs.create({ url, active: false }, (tab) => {
       if (chrome.runtime.lastError || !tab) {
@@ -90,113 +118,72 @@ async function fetchViaBackgroundTab(url) {
         return;
       }
       const tabId = tab.id;
-      let resolved = false;
+      let finished = false;
 
       const finish = (result) => {
-        if (resolved) return;
-        resolved = true;
+        if (finished) return;
+        finished = true;
+        clearInterval(probeInterval);
+        clearTimeout(hardTimeout);
         chrome.tabs.remove(tabId, () => { void chrome.runtime.lastError; });
         resolve(result);
       };
 
-      // 8秒超时兜底
-      const timeout = setTimeout(() => {
-        console.warn("[Cambridge] 页面抓取超时:", url);
+      // 强制 4 秒上限兜底，防止挂起
+      const hardTimeout = setTimeout(() => {
         finish({ html: "", finalUrl: url, hit: false });
-      }, 8000);
+      }, 4000);
 
-      // 在标签页内部持续轮询等待真实释义节点生成（最多等 4 秒）
-      const checkScript = `
-        new Promise((res) => {
-          let count = 0;
-          const interval = setInterval(() => {
-            count++;
-            const hasContent = document.querySelector(".def-block, .ddef_block, .phrase-block, .pr.dictionary");
-            const isNotFound = document.body && document.body.innerText.includes("did not match any document");
-            if (hasContent || isNotFound || count > 20) {
-              clearInterval(interval);
-              res({
-                html: document.documentElement.outerHTML,
-                finalUrl: window.location.href,
-                hit: !!hasContent
-              });
-            }
-          }, 200);
-        });
-      `;
-
-      // 监听网页初步加载完成，然后启动内部探测
-      const onUpdatedHandler = (updatedTabId, changeInfo) => {
-        if (updatedTabId === tabId && changeInfo.status === "complete") {
-          chrome.tabs.onUpdated.removeListener(onUpdatedHandler);
-          chrome.scripting.executeScript(
-            {
-              target: { tabId },
-              func: () => {
-                return new Promise((res) => {
-                  let count = 0;
-                  const interval = setInterval(() => {
-                    count++;
-                    const hasContent = document.querySelector(".def-block, .ddef_block, .phrase-block, .pr.dictionary");
-                    const isNotFound = document.body && (
-                      document.body.innerText.includes("did not match any") ||
-                      document.body.innerText.includes("未找到符合条件的结果")
-                    );
-                    if (hasContent || isNotFound || count > 20) {
-                      clearInterval(interval);
-                      res({
-                        html: document.documentElement.outerHTML,
-                        finalUrl: window.location.href,
-                        hit: !!hasContent
-                      });
-                    }
-                  }, 150);
-                });
+      // 每 90 毫秒高频探测一次 DOM 是否生成，生成就立刻交卷秒关
+      const probeInterval = setInterval(() => {
+        chrome.scripting.executeScript(
+          {
+            target: { tabId },
+            func: () => {
+              const hasContent = document.querySelector(".def-block, .ddef_block, .phrase-block, .pr.dictionary");
+              const isNotFound = document.body && (
+                document.body.innerText.includes("did not match any") ||
+                document.body.innerText.includes("未找到符合条件的结果")
+              );
+              if (hasContent || isNotFound) {
+                return {
+                  html: document.documentElement.outerHTML,
+                  finalUrl: window.location.href,
+                  hit: !!hasContent
+                };
               }
-            },
-            (results) => {
-              clearTimeout(timeout);
-              if (results && results[0] && results[0].result) {
-                console.log("[Cambridge] 页面抓取成功:", results[0].result.finalUrl, "命中状态:", results[0].result.hit);
-                finish(results[0].result);
-              } else {
-                finish({ html: "", finalUrl: url, hit: false });
-              }
+              return null;
             }
-          );
-        }
-      };
-
-      chrome.tabs.onUpdated.addListener(onUpdatedHandler);
+          },
+          (results) => {
+            if (chrome.runtime.lastError || !results || !results[0] || !results[0].result) return;
+            finish(results[0].result);
+          }
+        );
+      }, 90);
     });
   });
 }
 
-async function fetchCambridgeHtml(query) {
-  // 构造两种 URL：一种是直达词条页（最快最稳），一种是搜索页
+// 组合调度策略：优先直取 Slug -> 再取快速 Fetch -> 最后才上闪电探测
+async function fetchCambridgeFast(query) {
   const slug = query.trim().toLowerCase().replace(/[^a-z0-9\s-]/g, "").replace(/\s+/g, "-");
   const directUrl = `https://dictionary.cambridge.org/dictionary/english-chinese-simplified/${slug}`;
   const searchUrl = `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(query.trim())}`;
 
-  // 1. 尝试静默 fetch 直达页（命中就省去开标签页的时间）
-  try {
-    const res = await fetch(directUrl, { credentials: "include" });
-    if (res.status === 200) {
-      const html = await res.text();
-      if (html.includes("def-block") || html.includes("ddef_block") || html.includes("phrase-block")) {
-        console.log("[Cambridge] Fetch 直连命中:", directUrl);
-        return { html, finalUrl: res.url, hit: true };
-      }
-    }
-  } catch (e) {}
+  // 1. 尝试直接请求词条 Slug（耗时通常 < 600ms）
+  let directRes = await quickFetchHtml(directUrl);
+  if (directRes.hit) return directRes;
 
-  // 2. Fetch 没命中或被拦截，使用防抢跑后台真实标签页抓取
-  console.log("[Cambridge] 启动后台标签页渲染抓取:", directUrl);
-  let resTab = await fetchViaBackgroundTab(directUrl);
-  if (resTab.hit) return resTab;
+  // 2. 尝试快速搜索 URL
+  let searchRes = await quickFetchHtml(searchUrl);
+  if (searchRes.hit) return searchRes;
 
-  console.log("[Cambridge] 直达未中，转入搜索页抓取:", searchUrl);
-  return await fetchViaBackgroundTab(searchUrl);
+  // 3. 若均被拦截，启动毫秒级静默标签页探测
+  let tabRes = await fastTabProbe(directUrl);
+  if (tabRes.hit) return tabRes;
+
+  return await fastTabProbe(searchUrl);
 }
 
 async function invokeAnki(action, params = {}) {
@@ -212,20 +199,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "LOOKUP_CAMBRIDGE") {
     (async () => {
       try {
-        console.log("[Cambridge] 收到查询请求:", msg.query);
+        const queryKey = msg.query.trim().toLowerCase();
+        // 命中内存缓存直接 0 秒返回
+        if (memoryCache.has(queryKey)) {
+          sendResponse({ ok: true, pages: memoryCache.get(queryKey), candidates: [queryKey] });
+          return;
+        }
+
         const candidates = buildSearchCandidates(msg.query);
         const pages = [];
 
         for (const cand of candidates) {
-          const res = await fetchCambridgeHtml(cand);
+          const res = await fetchCambridgeFast(cand);
           if (res.hit) {
             pages.push({ cand, html: res.html, finalUrl: res.finalUrl });
             break;
           }
         }
+
+        if (pages.length > 0) {
+          memoryCache.set(queryKey, pages);
+        }
         sendResponse({ ok: true, pages, candidates });
       } catch (err) {
-        console.error("[Cambridge] 发生全局错误:", err);
         sendResponse({ ok: false, error: err.message });
       }
     })();
