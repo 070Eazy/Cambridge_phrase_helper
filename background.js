@@ -32,18 +32,18 @@ function deinflectFirstWord(word) {
 
   if (w.endsWith("ing") && w.length > 4) {
     const stem = w.slice(0, -3);
-    candidates.add(stem);
-    candidates.add(stem + "e");
+    candidates.add(stem + "e"); // 优先补e：taking -> take, shoring -> shore, making -> make
+    candidates.add(stem);       // 次选纯词干：rolling -> roll, bringing -> bring
     if (stem.length > 2 && stem.at(-1) === stem.at(-2)) {
-      candidates.add(stem.slice(0, -1));
+      candidates.add(stem.slice(0, -1)); // 双写还原：stopping -> stop, stepping -> step
     }
   }
   if (w.endsWith("ied") && w.length > 4) {
     candidates.add(w.slice(0, -3) + "y");
   } else if (w.endsWith("ed") && w.length > 3) {
     const stem = w.slice(0, -2);
-    candidates.add(stem);
-    candidates.add(w.slice(0, -1));
+    candidates.add(w.slice(0, -1)); // 优先补e：shored -> shore
+    candidates.add(stem);           // 次选纯词干：rolled -> roll
     if (stem.length > 2 && stem.at(-1) === stem.at(-2)) {
       candidates.add(stem.slice(0, -1));
     }
@@ -77,13 +77,15 @@ function buildSearchCandidates(rawQuery) {
     const firstTwo = words.slice(0, 2).join(" ");
     if (!list.includes(firstTwo)) list.push(firstTwo);
   }
-  return list.slice(0, 2); // 限制最多2个核心候选，杜绝排队延迟
+
+  // 放宽至前 4 个有效候选，确保原形 take / shore 等绝不被截断
+  return list.slice(0, 4);
 }
 
-// 1. 超轻量级快速 Fetch（耗时通常 < 800ms，只拉 HTML 字符，不加载广告/图片）
+// 超轻量级快速 Fetch（只拉 HTML 文本，不加载图片与广告）
 async function quickFetchHtml(url) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 2500); // 2.5秒超时断开
+  const timer = setTimeout(() => controller.abort(), 2500);
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -109,7 +111,7 @@ async function quickFetchHtml(url) {
   return { html: "", finalUrl: url, hit: false };
 }
 
-// 2. 闪电探测后台标签页（绝不傻等 complete，释义节点一出现立刻秒关标签页）
+// 毫秒级探测后台标签页
 async function fastTabProbe(url) {
   return new Promise((resolve) => {
     chrome.tabs.create({ url, active: false }, (tab) => {
@@ -129,12 +131,10 @@ async function fastTabProbe(url) {
         resolve(result);
       };
 
-      // 强制 4 秒上限兜底，防止挂起
       const hardTimeout = setTimeout(() => {
         finish({ html: "", finalUrl: url, hit: false });
       }, 4000);
 
-      // 每 90 毫秒高频探测一次 DOM 是否生成，生成就立刻交卷秒关
       const probeInterval = setInterval(() => {
         chrome.scripting.executeScript(
           {
@@ -165,21 +165,17 @@ async function fastTabProbe(url) {
   });
 }
 
-// 组合调度策略：优先直取 Slug -> 再取快速 Fetch -> 最后才上闪电探测
 async function fetchCambridgeFast(query) {
   const slug = query.trim().toLowerCase().replace(/[^a-z0-9\s-]/g, "").replace(/\s+/g, "-");
   const directUrl = `https://dictionary.cambridge.org/dictionary/english-chinese-simplified/${slug}`;
   const searchUrl = `https://dictionary.cambridge.org/search/english-chinese-simplified/direct/?q=${encodeURIComponent(query.trim())}`;
 
-  // 1. 尝试直接请求词条 Slug（耗时通常 < 600ms）
   let directRes = await quickFetchHtml(directUrl);
   if (directRes.hit) return directRes;
 
-  // 2. 尝试快速搜索 URL
   let searchRes = await quickFetchHtml(searchUrl);
   if (searchRes.hit) return searchRes;
 
-  // 3. 若均被拦截，启动毫秒级静默标签页探测
   let tabRes = await fastTabProbe(directUrl);
   if (tabRes.hit) return tabRes;
 
@@ -200,7 +196,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         const queryKey = msg.query.trim().toLowerCase();
-        // 命中内存缓存直接 0 秒返回
         if (memoryCache.has(queryKey)) {
           sendResponse({ ok: true, pages: memoryCache.get(queryKey), candidates: [queryKey] });
           return;
