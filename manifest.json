@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "剑桥短语划词助手 (Cambridge Phrase to Anki)",
+  "version": "1.1.0",
+  "description": "使用 Alt 键查询剑桥英汉双解词典短语并一键导入 Anki",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://dictionary.cambridge.org/*",
+    "https://dict.youdao.com/*",
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "all_frames": true
+    }
+  ]
+}
